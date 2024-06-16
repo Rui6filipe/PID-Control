@@ -1,0 +1,176 @@
+% main.m: Process Feedback 38-100, and PLC M340: Relay and PI(D) controller
+% by L. Brito Palma; 2023-01-05
+% NI USB DAQ 6008
+% Gnd, AI0: read level sensor, AI1: read control action;
+% AO0: write control action to pump actuator
+%
+clc, clear all, close all
+% time
+time.k = 1; time.tmax = input('Tmax[s]: 120? '); % 20 min * 60 s = 1200 s
+time.Ts = 80 / 1000; % input('Ts? '); % 200 ms for M340-2-tank;
+time.kmax = round(time.tmax / time.Ts);
+time.elapsed = zeros(time.kmax,1);
+% plant
+plant.model.mode = 'pct9setup3tk';
+plant.type = input('Plant("r-real,m-model"): ');
+% sensor
+sensor.n = 4;
+sensor.yr = zeros(time.kmax,sensor.n); 
+sensor.y = zeros(time.kmax,1); sensor.y0 = sensor.y;
+sensor.y1 = sensor.y;
+sensor.ym = sensor.y; % model output
+sensor.gain = 1/10; sensor.pole = 0.0;
+sensor.offset = 0.1113;
+% arxmodel
+arxstr.y = zeros(time.kmax,1); 
+% actuator
+actuator.ur = zeros(time.kmax,1);
+actuator.gain = 1 * 5;
+% digital controller
+dctr.u0 = zeros(time.kmax,1);
+dctr.u = zeros(time.kmax,1); % LP filtered
+dctr.pole = 0; % 0.8;
+% relay controller
+dctr.relay.u = zeros(time.kmax,1);
+dctr.relay.sp = zeros(time.kmax,1);
+dctr.relay = bprelay('init',dctr.relay,0,plant,time);
+dctr.ac = input('Controller(pi,relay,fuz,man): pi,re,fz,ma ');
+dctr.sp.y = zeros(time.kmax,1); % > sensor.offset: 0.1113
+% PI(D) controller
+dctr.pid.id = 'dctr.pid.id';
+dctr.pid = bppidbasic('init',dctr.pid,plant,time);
+if (plant.type == 'r')
+    xdaq.dev1.xpto = 1; xdaq.dev1 = usbdaq('Dev2','init',xdaq.dev1); % init DAQ; % USB daq struct
+    xdaq.dev1.u = [0.0 0.0]; xdaq.dev1 = usbdaq('Dev2','writ',xdaq.dev1); % write an initial value
+end
+% PRBS for parameter estimation: ARX model and NN-ARX model
+dctr.prbs.w = 10 / time.Ts; % 10 s: minimum pulse duration 
+% prbs.u1: sp = 0.3, +- prbs 0.02, for linear ARX parameter estimation
+dctr.prbs.u1 = idinput(time.kmax,'PRBS',[0 1/dctr.prbs.w],[-0.02 +0.02]);
+% prbs.u2: sp = NN training (estimation)
+dctr.prbs.u2(1:round(time.kmax/2)) = 0.2 + idinput(round(time.kmax/2)-1+1,'PRBS',[0 1/dctr.prbs.w],[-0.1 +0.1]);
+dctr.prbs.u2(1+round(time.kmax/2):time.kmax) = 0.3 + idinput(time.kmax-(1+round(time.kmax/2))+1,'PRBS',[0 1/dctr.prbs.w],[-0.1 +0.1]);
+% prbs.u3: sp = NN validation
+dctr.prbs.u3(1:round(time.kmax/2)) = 0.3 + idinput(round(time.kmax/2)-1+1,'PRBS',[0 1/dctr.prbs.w],[-0.1 +0.1]);
+dctr.prbs.u3(1+round(time.kmax/2):time.kmax) = 0.2 + idinput(time.kmax-(1+round(time.kmax/2))+1,'PRBS',[0 1/dctr.prbs.w],[-0.1 +0.1]);
+% Mamdani-type proportional controller
+fismat = readfis('bpfuzzycpman.fis'); % Read Fuzzy Structure (FIS) % LBP 
+dctr.fuz.e = zeros(time.kmax,1);
+dctr.fuz.output = zeros(time.kmax,1);
+% PI Fuzzy Controller
+% fismat = readfis('pifuz.fis'); % Read Fuzzy Structure (FIS) % LBP
+% Manual Controller
+dctr.manc.id = 'dctr.manc.id';
+dctr.manc = bphumanctr('init',dctr.manc,plant,time);
+% Neural network process model
+% load lab02_nnet_process.mat ... -> xnn
+
+% main program
+for k = 1:time.kmax
+    tic; time.k = k; 
+    % read sensors
+    if (plant.type == 'r')
+        xdaq.dev1 = usbdaq('Dev2','read',xdaq.dev1); sensor.yr(time.k,:) = xdaq.dev1.y(:)';
+        % sensor calibration
+        sensor.y0(time.k) = 1 * sensor.yr(time.k,1:1);  
+        sensor.y1(time.k) = 0; % sensor.gain * sensor.yr(time.k,2:2);
+    else
+        arxstr = arxmodel(arxstr,dctr,time);
+        sensor.ym(time.k) = arxstr.y(time.k);
+        sensor.y0(time.k) = sensor.ym(time.k);
+    end    
+    sensor.y0(time.k) = bpsatur(sensor.y0(time.k),0,1,'sat');
+    
+    % LP filter ...
+    if (time.k > 1),
+        sensor.y(time.k) = sensor.pole * sensor.y(time.k-1) + (1 - sensor.pole) * sensor.y0(time.k);
+    end;
+    
+    % additive output sensor fault
+    if 0 & (time.k > (0.5 * time.kmax))
+        sensor.fs.adit = 0.0; % -0.1, +0.1;
+        sensor.y(time.k) = sensor.y0(time.k) + sensor.fs.adit;
+    end
+    
+    % exp1: [0.1 0.3 0.2 0.4 0.1]
+    % exp2: [0.1 0.4 0.2 0.1 0.3]
+    if (time.k <= (1/5*time.kmax)), dctr.sp.y(time.k) = 10/100;
+    elseif (time.k <= (2/5*time.kmax)), dctr.sp.y(time.k) = 30/100; 
+    elseif (time.k <= (3/5*time.kmax)), dctr.sp.y(time.k) = 20/100;     
+    elseif (time.k <= (4/5*time.kmax)), dctr.sp.y(time.k) = 40/100;         
+    else dctr.sp.y(time.k) = 50/100;
+    end
+    dctr.sp.y(time.k) = 
+    sensor.offset
+    % NN training
+    % dctr.sp.y(time.k) = 0.5;
+    
+    dctr.relay.sp(time.k) = dctr.sp.y(time.k);
+    
+    % relay controller
+    if (dctr.ac == 're')
+        dctr.relay = bprelay('xrun',dctr.relay,sensor.y(time.k),plant,time);    
+        dctr.u0(time.k) = dctr.relay.u(time.k); % dctr.command; % Volt !!!    
+        % LP filter ...
+        if (time.k > 1),
+            dctr.u(time.k) = dctr.pole * dctr.u(time.k-1) + (1 - dctr.pole) * dctr.u0(time.k);
+        end;    
+        dctr.u(time.k) = bpsatur(dctr.u(time.k),0,1,'sat');
+    % classical PI controller
+    elseif (dctr.ac == 'pi')
+        dctr.pid.r(time.k) = dctr.sp.y(time.k);
+        dctr.pid.y(time.k) = sensor.y(time.k);
+        dctr.pid = bppidbasic('xrun',dctr.pid,plant,time);
+        dctr.u(time.k) = dctr.pid.u(time.k);
+        dctr.u(time.k) = bpsatur(dctr.u(time.k),0,1,'sat');
+    % Mamdani-type Proportional Fuzzy controller
+    elseif (dctr.ac == 'fz')
+        dctr.fuz.e(time.k) = dctr.sp.y(time.k) - sensor.y(time.k);
+        dctr.fuz.output(time.k) = evalfis([dctr.fuz.e(time.k)], fismat);
+        dctr.u(time.k) = dctr.fuz.output(time.k);
+        dctr.u(time.k) = bpsatur(dctr.u(time.k),0,1,'sat');
+    % Manual Controller
+    elseif (dctr.ac == 'ma')
+        % dctr.manc = bphumanctr('xrun',dctr.manc,plant,time);
+        % dctr.u(time.k) = dctr.manc.u(time.k);
+        dctr.u(time.k) = 0;
+        dctr.u(time.k) = bpsatur(dctr.u(time.k),0,1,'sat');
+    end
+    
+    % dctr.u(time.k) = 0; 
+    
+    
+    % actuator
+    if (plant.type == 'r')
+        actuator.ur(time.k) = actuator.gain * dctr.u(time.k);
+        xdaq.dev1.u = [actuator.ur(time.k) 0.0];
+        xdaq.dev1 = usbdaq('Dev2','writ',xdaq.dev1);
+        time.cpu = toc; pause(time.Ts-time.cpu);
+    end
+    
+    if (time.k == round(2/time.Ts)) | (mod(time.k,round(2/time.Ts)) == 0)
+        % (mod(time.k,round(0.01*time.kmax)) == 0)
+        [time.k / time.kmax]
+        plot((1:time.k)*time.Ts,dctr.relay.sp(1:time.k),'r-.', ...
+            (1:time.k)*time.Ts,dctr.u(1:time.k),'g', ...
+            (1:time.k)*time.Ts,sensor.y(1:time.k),'b', ...
+            (1:time.k)*time.Ts,0*sensor.y0(1:time.k),'m-.', ...
+            (1:time.k)*time.Ts,0*sensor.y1(1:time.k),'m' ...                
+        );
+        xlabel('Time[s]'); ylabel('r,y,y1,u'); title('Signals [r u y y1] = [R G B M]');
+        pause(1/1000);
+    end
+    
+end
+
+if (plant.type == 'r')
+    xdaq.dev1.u = [0.0 0.0]; xdaq.dev1 = usbdaq('Dev2','writ',xdaq.dev1); % write an initial value
+end
+
+% Training data for neural network: NN-ARX process model
+% save data_m340_relay_ctr_sp05.mat % Relay Controller on M340 PLC
+save data-hw01-aa.mat % PID Controller on M340 PLC
+% Validation data for neural network: NN-ARX process model
+% save data_exper_prbs_nn_valid_pmodel.mat
+
+% --- eof ---
